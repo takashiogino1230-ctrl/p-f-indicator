@@ -1,0 +1,265 @@
+//@version=6
+indicator("P&F 売買シグナル 終値ベース 修正版", overlay=true, max_labels_count=500, max_lines_count=500, max_bars_back=500)
+
+// =============================
+// 入力項目
+// =============================
+boxSize = input.float(0.2, "ボックスサイズ", step=0.1)
+reversalBox = input.int(3, "転換枠数", minval=1)
+targetMultiplier = input.float(3.0, "利確倍率", step=0.5)
+showLevels = input.bool(true, "利確・損切ラインを表示")
+lineLength = input.int(40, "ライン表示本数", minval=5)
+
+// =============================
+// 終値をボックス番号に変換
+// =============================
+priceToBox(price) =>
+    int(math.floor(price / boxSize))
+
+boxToPrice(box) =>
+    box * boxSize
+
+pfBox = priceToBox(close)
+
+// =============================
+// P&F状態管理
+// direction: 1 = X列、-1 = O列、0 = 初期状態
+// =============================
+var int direction = 0
+var int columnHighBox = na
+var int columnLowBox = na
+
+// 直近の確定済みX列高値・O列安値
+var int prevXHighBox = na
+var int prevOLowBox = na
+
+// ブレイク判定用
+var int buyBreakBox = na
+var int sellBreakBox = na
+
+// セットアップ管理
+var bool buySetupReady = false
+var bool sellSetupReady = false
+
+// レンジ管理
+var int rangeHighBox = na
+var int rangeLowBox = na
+var int rangeColumnCount = 1
+
+// エントリー中管理
+var bool inTrade = false
+var int tradeDirection = 0
+var float activeTp = na
+var float activeSl = na
+
+// =============================
+// 初期化
+// =============================
+if na(columnHighBox)
+    columnHighBox := pfBox
+    columnLowBox := pfBox
+
+buySignal = false
+sellSignal = false
+
+// =============================
+// 利確・損切到達チェック
+// ※ここは実際のローソク足高値・安値で判定
+// =============================
+if inTrade and tradeDirection == 1
+    if high >= activeTp or low <= activeSl
+        inTrade := false
+        tradeDirection := 0
+        activeTp := na
+        activeSl := na
+
+if inTrade and tradeDirection == -1
+    if low <= activeTp or high >= activeSl
+        inTrade := false
+        tradeDirection := 0
+        activeTp := na
+        activeSl := na
+
+// =============================
+// P&Fロジック：終値ベース
+// =============================
+
+// 初期状態
+if direction == 0
+    if pfBox >= columnHighBox + 1
+        direction := 1
+        columnHighBox := pfBox
+        columnLowBox := pfBox
+
+    else if pfBox <= columnLowBox - 1
+        direction := -1
+        columnLowBox := pfBox
+        columnHighBox := pfBox
+
+// =============================
+// X列中
+// =============================
+else if direction == 1
+
+    // X列継続
+    if pfBox >= columnHighBox + 1
+        columnHighBox := pfBox
+
+    // X列からO列へ3箱転換
+    if pfBox <= columnHighBox - reversalBox
+
+        // 今のX列を確定
+        prevXHighBox := columnHighBox
+
+        // BUY用ブレイク水準を保存
+        buyBreakBox := prevXHighBox + 1
+
+        // レンジ上限を更新
+        if na(rangeHighBox)
+            rangeHighBox := prevXHighBox
+        else
+            rangeHighBox := math.max(rangeHighBox, prevXHighBox)
+
+        // X列→O列が発生したので、次のX列でBUY判定可能
+        buySetupReady := true
+
+        // O列へ転換
+        direction := -1
+        columnLowBox := pfBox
+
+        // レンジ列数を加算
+        rangeColumnCount := rangeColumnCount + 1
+
+// =============================
+// O列中
+// =============================
+else if direction == -1
+
+    // O列継続
+    if pfBox <= columnLowBox - 1
+        columnLowBox := pfBox
+
+    // O列からX列へ3箱転換
+    if pfBox >= columnLowBox + reversalBox
+
+        // 今のO列を確定
+        prevOLowBox := columnLowBox
+
+        // SELL用ブレイク水準を保存
+        sellBreakBox := prevOLowBox - 1
+
+        // レンジ下限を更新
+        if na(rangeLowBox)
+            rangeLowBox := prevOLowBox
+        else
+            rangeLowBox := math.min(rangeLowBox, prevOLowBox)
+
+        // O列→X列が発生したので、次のO列でSELL判定可能
+        sellSetupReady := true
+
+        // X列へ転換
+        direction := 1
+        columnHighBox := pfBox
+
+        // レンジ列数を加算
+        rangeColumnCount := rangeColumnCount + 1
+
+// =============================
+// 買いシグナル
+// 条件：X列 → O列 → 次のX列が前回X列高値を1ボックス上抜け
+// =============================
+if direction == 1 and buySetupReady and not na(buyBreakBox) and not inTrade
+    if columnHighBox >= buyBreakBox
+        buySignal := true
+
+        entryBox = buyBreakBox
+        entryPrice = boxToPrice(entryBox)
+
+        // 利確：エントリー価格 + ボックスサイズ × レンジ列数 × 利確倍率
+        tp = entryPrice + boxSize * rangeColumnCount * targetMultiplier
+
+        // 損切は直近O列安値
+        sl = not na(prevOLowBox) ? boxToPrice(prevOLowBox) : na
+
+        inTrade := true
+        tradeDirection := 1
+        activeTp := tp
+        activeSl := sl
+
+        calcText = "買いシグナル\n" +
+             "条件: X列 → O列 → 次のX列が前回X列高値を更新\n" +
+             "前回X列高値: " + str.tostring(boxToPrice(prevXHighBox)) + "\n" +
+             "ブレイク価格: " + str.tostring(entryPrice) + "\n" +
+             "レンジ列数: " + str.tostring(rangeColumnCount) + "\n" +
+             "利確計算: " + str.tostring(boxSize) + " × " + str.tostring(rangeColumnCount) + " × " + str.tostring(targetMultiplier) + " = " + str.tostring(boxSize * rangeColumnCount * targetMultiplier) + "\n" +
+             "利確価格: " + str.tostring(tp) + "\n" +
+             "損切価格: " + str.tostring(sl)
+
+        label.new(bar_index, entryPrice, "BUY\n" + str.tostring(entryPrice), style=label.style_label_up, textcolor=color.white, color=color.green, tooltip=calcText)
+
+        if showLevels
+            line.new(bar_index, tp, bar_index + lineLength, tp, color=color.green, width=2)
+            label.new(bar_index + lineLength, tp, "利確 " + str.tostring(tp), style=label.style_label_left, textcolor=color.white, color=color.green, tooltip=calcText)
+
+            if not na(sl)
+                line.new(bar_index, sl, bar_index + lineLength, sl, color=color.red, width=2)
+                label.new(bar_index + lineLength, sl, "損切 " + str.tostring(sl), style=label.style_label_left, textcolor=color.white, color=color.red, tooltip=calcText)
+
+        buySetupReady := false
+        sellSetupReady := false
+        rangeColumnCount := 1
+        rangeHighBox := na
+        rangeLowBox := na
+
+// =============================
+// 売りシグナル
+// 条件：O列 → X列 → 次のO列が前回O列安値を1ボックス下抜け
+// =============================
+if direction == -1 and sellSetupReady and not na(sellBreakBox) and not inTrade
+    if columnLowBox <= sellBreakBox
+        sellSignal := true
+
+        entryBox = sellBreakBox
+        entryPrice = boxToPrice(entryBox)
+
+        // 利確：エントリー価格 - ボックスサイズ × レンジ列数 × 利確倍率
+        tp = entryPrice - boxSize * rangeColumnCount * targetMultiplier
+
+        // 損切は直近X列高値
+        sl = not na(prevXHighBox) ? boxToPrice(prevXHighBox) : na
+
+        inTrade := true
+        tradeDirection := -1
+        activeTp := tp
+        activeSl := sl
+
+        calcText = "売りシグナル\n" +
+             "条件: O列 → X列 → 次のO列が前回O列安値を更新\n" +
+             "前回O列安値: " + str.tostring(boxToPrice(prevOLowBox)) + "\n" +
+             "ブレイク価格: " + str.tostring(entryPrice) + "\n" +
+             "レンジ列数: " + str.tostring(rangeColumnCount) + "\n" +
+             "利確計算: " + str.tostring(boxSize) + " × " + str.tostring(rangeColumnCount) + " × " + str.tostring(targetMultiplier) + " = " + str.tostring(boxSize * rangeColumnCount * targetMultiplier) + "\n" +
+             "利確価格: " + str.tostring(tp) + "\n" +
+             "損切価格: " + str.tostring(sl)
+
+        label.new(bar_index, entryPrice, "SELL\n" + str.tostring(entryPrice), style=label.style_label_down, textcolor=color.white, color=color.red, tooltip=calcText)
+
+        if showLevels
+            line.new(bar_index, tp, bar_index + lineLength, tp, color=color.green, width=2)
+            label.new(bar_index + lineLength, tp, "利確 " + str.tostring(tp), style=label.style_label_left, textcolor=color.white, color=color.green, tooltip=calcText)
+
+            if not na(sl)
+                line.new(bar_index, sl, bar_index + lineLength, sl, color=color.red, width=2)
+                label.new(bar_index + lineLength, sl, "損切 " + str.tostring(sl), style=label.style_label_left, textcolor=color.white, color=color.red, tooltip=calcText)
+
+        sellSetupReady := false
+        buySetupReady := false
+        rangeColumnCount := 1
+        rangeHighBox := na
+        rangeLowBox := na
+
+// =============================
+// アラート
+// =============================
+alertcondition(buySignal, title="P&F買い", message="P&F買いシグナル")
+alertcondition(sellSignal, title="P&F売り", message="P&F売りシグナル")
