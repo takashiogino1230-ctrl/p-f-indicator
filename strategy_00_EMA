@@ -1,0 +1,160 @@
+//@version=6
+strategy("3本ヒゲ + 三尊/逆三尊 + EMA傾き + 時間制限 + 固定損失", overlay=true, max_bars_back=500, pyramiding=0, process_orders_on_close=true, max_lines_count=500)
+
+// ===== 入力 =====
+wickBodyRatio = input.float(1.0, "ヒゲ/実体 最低倍率", minval=0.1, step=0.1)
+oppositeWickMaxRatio = input.float(0.5, "反対側ヒゲ最大比率", minval=0.0, step=0.1)
+riskReward = input.float(2.0, "利確倍率", minval=0.1, step=0.1)
+
+// ===== 固定損失 =====
+riskYen = input.float(10000, "損失額（円）", minval=1)
+pipSize = input.float(0.01, "1pipの価格幅", minval=0.00001)
+pipValuePerLot = input.float(1000, "1ロットあたり1pipの価値（円）", minval=1)
+minLot = input.float(0.01, "最小ロット", minval=0.01)
+maxLot = input.float(100.0, "最大ロット", minval=0.01)
+
+// ===== EMAフィルター =====
+useEmaFilter = input.bool(true, "EMAフィルターを使う")
+emaLen = input.int(20, "EMA期間", minval=1)
+emaSlopeLookback = input.int(3, "EMA傾き判定本数", minval=1)
+
+// ===== 時間制限 =====
+useTimeFilter = input.bool(true, "時間制限を使う")
+tz = input.string("Asia/Tokyo", "タイムゾーン")
+
+h = hour(time, tz)
+m = minute(time, tz)
+
+// 00:00〜09:00はエントリー禁止
+noEntryNight = h >= 0 and h < 9
+
+// 11:50〜12:10はエントリー禁止
+noEntryLunch = (h == 11 and m >= 50) or (h == 12 and m <= 10)
+
+// 新規エントリー可能時間か
+timeOk = not useTimeFilter or not (noEntryNight or noEntryLunch)
+
+// ===== EMA計算 =====
+ema = ta.ema(close, emaLen)
+
+emaUp = ema > ema[emaSlopeLookback]
+emaDown = ema < ema[emaSlopeLookback]
+
+// ===== ローソク足情報 =====
+body = math.abs(close - open)
+safeBody = body == 0.0 ? syminfo.mintick : body
+
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+
+// ===== ヒゲ判定 =====
+// ロング：下ヒゲが実体の指定倍率以上、かつ上ヒゲが下ヒゲの指定比率以下
+validLower = lowerWick >= safeBody * wickBodyRatio and upperWick <= lowerWick * oppositeWickMaxRatio
+
+// ショート：上ヒゲが実体の指定倍率以上、かつ下ヒゲが上ヒゲの指定比率以下
+validUpper = upperWick >= safeBody * wickBodyRatio and lowerWick <= upperWick * oppositeWickMaxRatio
+
+// ===== 3本ヒゲ判定 =====
+threeLower = validLower and validLower[1] and validLower[2]
+threeUpper = validUpper and validUpper[1] and validUpper[2]
+
+// ===== 三尊/逆三尊 条件 =====
+// ロング：3本のうち、真ん中の安値が一番低い
+middleLowest = low[1] < low[2] and low[1] < low
+
+// ショート：3本のうち、真ん中の高値が一番高い
+middleHighest = high[1] > high[2] and high[1] > high
+
+// ===== 3本目のローソク足条件 =====
+// ロング：3本目が陽線
+// ショート：3本目が陰線
+thirdBull = close > open
+thirdBear = close < open
+
+// ===== ポジション判定 =====
+inPos = strategy.position_size != 0
+
+// ===== エントリー条件 =====
+// 時間制限は新規エントリーのみに適用
+longEntry = threeLower and middleLowest and thirdBull and (not useEmaFilter or emaUp) and timeOk and not inPos
+shortEntry = threeUpper and middleHighest and thirdBear and (not useEmaFilter or emaDown) and timeOk and not inPos
+
+// ===== SL / TP計算 =====
+longSL = math.min(low, math.min(low[1], low[2]))
+longRisk = close - longSL
+longTP = close + longRisk * riskReward
+
+shortSL = math.max(high, math.max(high[1], high[2]))
+shortRisk = shortSL - close
+shortTP = close - shortRisk * riskReward
+
+// ===== ロット計算 =====
+longPips = longRisk / pipSize
+shortPips = shortRisk / pipSize
+
+rawLongLot = riskYen / (longPips * pipValuePerLot)
+rawShortLot = riskYen / (shortPips * pipValuePerLot)
+
+longLot = math.min(math.max(rawLongLot, minLot), maxLot)
+shortLot = math.min(math.max(rawShortLot, minLot), maxLot)
+
+// ===== ライン管理 =====
+var float tradeSl = na
+var float tradeTp = na
+var line slLine = na
+var line tpLine = na
+
+// ===== 決済検知 =====
+var int prevClosed = 0
+closedNow = strategy.closedtrades > prevClosed
+
+if closedNow
+    if not na(slLine)
+        line.set_x2(slLine, bar_index)
+    if not na(tpLine)
+        line.set_x2(tpLine, bar_index)
+
+prevClosed := strategy.closedtrades
+
+// ===== 勝敗表示 =====
+lastProfit = closedNow ? strategy.closedtrades.profit(strategy.closedtrades - 1) : na
+win = closedNow and lastProfit > 0
+loss = closedNow and lastProfit <= 0
+
+// ===== ロングエントリー =====
+if longEntry and longRisk > 0 and longPips > 0
+    tradeSl := longSL
+    tradeTp := longTP
+
+    strategy.entry("L", strategy.long, qty=longLot, comment="L")
+    strategy.exit("LX", from_entry="L", stop=tradeSl, limit=tradeTp)
+
+    slLine := line.new(bar_index, tradeSl, bar_index + 1, tradeSl, color=color.new(color.red, 0), width=2)
+    tpLine := line.new(bar_index, tradeTp, bar_index + 1, tradeTp, color=color.new(color.green, 0), width=2)
+
+// ===== ショートエントリー =====
+if shortEntry and shortRisk > 0 and shortPips > 0
+    tradeSl := shortSL
+    tradeTp := shortTP
+
+    strategy.entry("S", strategy.short, qty=shortLot, comment="S")
+    strategy.exit("SX", from_entry="S", stop=tradeSl, limit=tradeTp)
+
+    slLine := line.new(bar_index, tradeSl, bar_index + 1, tradeSl, color=color.new(color.red, 0), width=2)
+    tpLine := line.new(bar_index, tradeTp, bar_index + 1, tradeTp, color=color.new(color.green, 0), width=2)
+
+// ===== 保有中はラインを延長 =====
+if strategy.position_size != 0
+    if not na(slLine)
+        line.set_x2(slLine, bar_index)
+    if not na(tpLine)
+        line.set_x2(tpLine, bar_index)
+
+// ===== 表示 =====
+plot(ema, "EMA", color=color.new(color.orange, 0), linewidth=2)
+
+plotshape(longEntry, title="ロング", text="L", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 0), textcolor=color.white, size=size.small)
+plotshape(shortEntry, title="ショート", text="S", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+
+plotshape(win, title="利確", text="○", style=shape.circle, location=location.abovebar, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+plotshape(loss, title="損切り", text="×", style=shape.xcross, location=location.belowbar, color=color.new(color.purple, 0), textcolor=color.white, size=size.small)
